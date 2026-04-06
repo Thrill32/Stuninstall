@@ -98,6 +98,56 @@ get_stunnel_user_group () {
     echo "${user_name}:${group_name}"
 }
 
+generate_ta_key () {
+    local key_path="$1"
+    local key_dir
+    local tmp_key
+    local err_log
+
+    key_dir="$(dirname "$key_path")"
+    mkdir -p "$key_dir" || {
+        echo "Failed to create key directory: $key_dir"
+        return 1
+    }
+
+    if [ -s "$key_path" ] && grep -q "BEGIN OpenVPN Static key V1" "$key_path" 2>/dev/null; then
+        chmod 600 "$key_path" 2>/dev/null || true
+        return 0
+    fi
+
+    tmp_key="$(mktemp "${key_path}.tmp.XXXXXX" 2>/dev/null || printf "%s.tmp.%s" "$key_path" "$$")"
+    err_log="$(mktemp "${key_path}.err.XXXXXX" 2>/dev/null || printf "%s.err.%s" "$key_path" "$$")"
+    rm -f "$tmp_key" "$err_log"
+
+    if openvpn --genkey secret "$tmp_key" 2>"$err_log"; then
+        :
+    elif openvpn --genkey --secret "$tmp_key" 2>>"$err_log"; then
+        :
+    else
+        echo "OpenVPN failed to generate tls-crypt key. Command output:"
+        sed 's/^/  /' "$err_log" 2>/dev/null || true
+        rm -f "$tmp_key" "$err_log"
+        echo "Failed to generate tls-crypt key at $key_path"
+        return 1
+    fi
+
+    if ! grep -q "BEGIN OpenVPN Static key V1" "$tmp_key" 2>/dev/null; then
+        echo "OpenVPN generated an invalid tls-crypt key file: $tmp_key"
+        rm -f "$tmp_key" "$err_log"
+        echo "Failed to generate tls-crypt key at $key_path"
+        return 1
+    fi
+
+    mv -f "$tmp_key" "$key_path" || {
+        echo "Failed to move generated tls-crypt key into place: $key_path"
+        rm -f "$tmp_key" "$err_log"
+        return 1
+    }
+
+    rm -f "$err_log"
+    chmod 600 "$key_path" 2>/dev/null || true
+}
+
 ensure_ip_forwarding () {
     local current
 
@@ -294,7 +344,7 @@ case "$1" in
         ./easyrsa gen-dh
         ./easyrsa gen-crl
 
-        openvpn --genkey secret /etc/stun/ta.key
+        generate_ta_key /etc/stun/ta.key || exit 1
 
         cp pki/ca.crt /etc/stun
         cp pki/issued/server.crt /etc/stun
@@ -531,7 +581,6 @@ cipher AES-256-GCM
 persist-key
 persist-tun
 
-key-direction 1
 auth SHA256
 
 remote-cert-tls server
