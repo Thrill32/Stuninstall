@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 
 #install stunnel4, openvpn, and easyrsa
+PIDS_FILE="/etc/stun/pids.txt"
+OPENVPN_PID_FILE="/etc/stun/openvpn.pid"
+STUNNEL_PID_FILE="/etc/stun/stunnel.pid"
+MASQ_IFACE_FILE="/etc/stun/masq_iface"
+IP_FORWARD_STATE_FILE="/etc/stun/ip_forward.prev"
+MASQ_RULE_COMMENT="stuninstall-masq"
+FWD_OUT_RULE_COMMENT="stuninstall-fwd-out"
+FWD_IN_RULE_COMMENT="stuninstall-fwd-in"
 
 get_pm () {
     for mgr in apt dnf yum pacman zypper apk; do
@@ -47,19 +55,178 @@ get_default_iface () {
     echo "$iface"
 }
 
+group_exists () {
+    local group_name="$1"
+
+    if command -v getent >/dev/null 2>&1; then
+        getent group "$group_name" >/dev/null 2>&1
+        return
+    fi
+
+    grep -q "^${group_name}:" /etc/group 2>/dev/null
+}
+
+get_stunnel_user_group () {
+    local candidate
+    local user_name=""
+    local group_name=""
+
+    for candidate in stunnel4 stunnel nobody; do
+        if id -u "$candidate" >/dev/null 2>&1; then
+            user_name="$candidate"
+            break
+        fi
+    done
+
+    for candidate in stunnel4 stunnel nogroup nobody; do
+        if group_exists "$candidate"; then
+            group_name="$candidate"
+            break
+        fi
+    done
+
+    user_name="${user_name:-nobody}"
+    if [ -z "$group_name" ]; then
+        group_name="$(id -gn "$user_name" 2>/dev/null)"
+    fi
+    group_name="${group_name:-nobody}"
+    echo "${user_name}:${group_name}"
+}
+
+ensure_ip_forwarding () {
+    local current
+
+    if command -v sysctl >/dev/null 2>&1; then
+        current="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
+    else
+        current="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+    fi
+
+    if [ -z "$current" ]; then
+        echo "Unable to read net.ipv4.ip_forward"
+        return 1
+    fi
+
+    echo "$current" > "$IP_FORWARD_STATE_FILE"
+
+    if [ "$current" != "1" ]; then
+        if command -v sysctl >/dev/null 2>&1; then
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || {
+                echo "Failed to enable IPv4 forwarding"
+                return 1
+            }
+        else
+            echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || {
+                echo "Failed to enable IPv4 forwarding"
+                return 1
+            }
+        fi
+    fi
+}
+
+restore_ip_forwarding () {
+    local previous
+
+    if [ ! -f "$IP_FORWARD_STATE_FILE" ]; then
+        return 0
+    fi
+
+    previous="$(cat "$IP_FORWARD_STATE_FILE" 2>/dev/null)"
+    rm -f "$IP_FORWARD_STATE_FILE"
+
+    case "$previous" in
+        0|1)
+            if command -v sysctl >/dev/null 2>&1; then
+                sysctl -w "net.ipv4.ip_forward=${previous}" >/dev/null 2>&1 || true
+            else
+                echo "$previous" > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+            fi
+            ;;
+        *)
+            ;;
+    esac
+}
+
 add_masq_rule () {
     local iface="$1"
 
-    iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
-        iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+    iptables -t nat -C POSTROUTING -o "$iface" -m comment --comment "$MASQ_RULE_COMMENT" -j MASQUERADE >/dev/null 2>&1 || \
+        iptables -t nat -A POSTROUTING -o "$iface" -m comment --comment "$MASQ_RULE_COMMENT" -j MASQUERADE
 }
 
 remove_masq_rule () {
     local iface="$1"
 
-    while iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1; do
-        iptables -t nat -D POSTROUTING -o "$iface" -j MASQUERADE || break
+    while iptables -t nat -C POSTROUTING -o "$iface" -m comment --comment "$MASQ_RULE_COMMENT" -j MASQUERADE >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -o "$iface" -m comment --comment "$MASQ_RULE_COMMENT" -j MASQUERADE || break
     done
+}
+
+add_forward_rules () {
+    local iface="$1"
+
+    iptables -C FORWARD -i tun+ -o "$iface" -m comment --comment "$FWD_OUT_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -A FORWARD -i tun+ -o "$iface" -m comment --comment "$FWD_OUT_RULE_COMMENT" -j ACCEPT
+
+    if iptables -C FORWARD -i "$iface" -o tun+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
+       iptables -C FORWARD -i "$iface" -o tun+ -m state --state RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1; then
+        return 0
+    fi
+
+    iptables -A FORWARD -i "$iface" -o tun+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -A FORWARD -i "$iface" -o tun+ -m state --state RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT
+}
+
+remove_forward_rules () {
+    local iface="$1"
+
+    while iptables -C FORWARD -i tun+ -o "$iface" -m comment --comment "$FWD_OUT_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -i tun+ -o "$iface" -m comment --comment "$FWD_OUT_RULE_COMMENT" -j ACCEPT || break
+    done
+
+    while iptables -C FORWARD -i "$iface" -o tun+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -i "$iface" -o tun+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT || break
+    done
+
+    while iptables -C FORWARD -i "$iface" -o tun+ -m state --state RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D FORWARD -i "$iface" -o tun+ -m state --state RELATED,ESTABLISHED -m comment --comment "$FWD_IN_RULE_COMMENT" -j ACCEPT || break
+    done
+}
+
+stop_pid_if_match () {
+    local pid="$1"
+    local kind="$2"
+    local comm
+
+    if [ -z "$pid" ] || ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')"
+    case "$kind" in
+        openvpn)
+            [ "$comm" = "openvpn" ] || return 0
+            ;;
+        stunnel)
+            case "$comm" in
+                stunnel|stunnel4) ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
 }
 
 install_deps () {
@@ -187,15 +354,18 @@ EOF
 
         chmod 600 stunnel.pem
 
+        STUNNEL_UG="$(get_stunnel_user_group)"
+        STUNNEL_USER="${STUNNEL_UG%:*}"
+        STUNNEL_GROUP="${STUNNEL_UG#*:}"
 
 
 
         cat <<EOF > stunconfig.conf
-pid = /etc/stun/stunnel.pid
+pid = $STUNNEL_PID_FILE
 cert = /etc/stun/stunnel.pem
 client = no
-setuid = stunnel4
-setgid = stunnel4
+setuid = $STUNNEL_USER
+setgid = $STUNNEL_GROUP
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 foreground = no
@@ -219,6 +389,11 @@ EOF
 
         ;;
     start)
+        if ! command -v iptables >/dev/null 2>&1; then
+            echo "iptables is required but not found"
+            exit 1
+        fi
+
         STUNNEL_BIN="$(get_stunnel_bin)" || {
             echo "stunnel binary not found"
             exit 1
@@ -227,34 +402,85 @@ EOF
             echo "Could not detect default network interface for MASQUERADE"
             exit 1
         }
+
+        ensure_ip_forwarding || exit 1
+
+        add_forward_rules "$DEFAULT_IFACE" || {
+            echo "Failed to add FORWARD rules for interface: $DEFAULT_IFACE"
+            exit 1
+        }
         add_masq_rule "$DEFAULT_IFACE" || {
             echo "Failed to add MASQUERADE rule on interface: $DEFAULT_IFACE"
             exit 1
         }
-        echo "$DEFAULT_IFACE" > /etc/stun/masq_iface
-        openvpn --daemon --config /etc/stun/server.conf
-        "$STUNNEL_BIN" /etc/stun/stunconfig.conf
+        echo "$DEFAULT_IFACE" > "$MASQ_IFACE_FILE"
+
+        openvpn --daemon --writepid "$OPENVPN_PID_FILE" --config /etc/stun/server.conf || {
+            echo "Failed to start OpenVPN"
+            remove_forward_rules "$DEFAULT_IFACE"
+            remove_masq_rule "$DEFAULT_IFACE"
+            rm -f "$MASQ_IFACE_FILE"
+            restore_ip_forwarding
+            exit 1
+        }
+
+        "$STUNNEL_BIN" /etc/stun/stunconfig.conf || {
+            echo "Failed to start stunnel"
+            OPENVPN_PID="$(cat "$OPENVPN_PID_FILE" 2>/dev/null)"
+            stop_pid_if_match "$OPENVPN_PID" "openvpn"
+            remove_forward_rules "$DEFAULT_IFACE"
+            remove_masq_rule "$DEFAULT_IFACE"
+            rm -f "$MASQ_IFACE_FILE" "$OPENVPN_PID_FILE"
+            restore_ip_forwarding
+            exit 1
+        }
+
+        sleep 1
+        OPENVPN_PID="$(cat "$OPENVPN_PID_FILE" 2>/dev/null)"
+        STUNNEL_PID="$(cat "$STUNNEL_PID_FILE" 2>/dev/null)"
+        cat <<EOF > "$PIDS_FILE"
+OPENVPN_PID=$OPENVPN_PID
+STUNNEL_PID=$STUNNEL_PID
+SAVED_IFACE=$DEFAULT_IFACE
+EOF
+
+        echo "Started services: openvpn pid=${OPENVPN_PID:-unknown}, stunnel pid=${STUNNEL_PID:-unknown}"
         ;;
     stop)
-        pkill -x openvpn 2>/dev/null
-        pkill -x stunnel 2>/dev/null
-        pkill -x stunnel4 2>/dev/null
-
+        OPENVPN_PID=""
+        STUNNEL_PID=""
         SAVED_IFACE=""
-        if [ -f /etc/stun/masq_iface ]; then
-            SAVED_IFACE="$(cat /etc/stun/masq_iface 2>/dev/null)"
+
+        if [ -f "$PIDS_FILE" ]; then
+            # shellcheck disable=SC1090
+            . "$PIDS_FILE"
+        fi
+        if [ -z "$SAVED_IFACE" ] && [ -n "$MASQ_IFACE" ]; then
+            SAVED_IFACE="$MASQ_IFACE"
         fi
 
-        if [ -n "$SAVED_IFACE" ]; then
+        if [ -z "$OPENVPN_PID" ] && [ -f "$OPENVPN_PID_FILE" ]; then
+            OPENVPN_PID="$(cat "$OPENVPN_PID_FILE" 2>/dev/null)"
+        fi
+        if [ -z "$STUNNEL_PID" ] && [ -f "$STUNNEL_PID_FILE" ]; then
+            STUNNEL_PID="$(cat "$STUNNEL_PID_FILE" 2>/dev/null)"
+        fi
+
+        stop_pid_if_match "$OPENVPN_PID" "openvpn"
+        stop_pid_if_match "$STUNNEL_PID" "stunnel"
+
+        if [ -z "$SAVED_IFACE" ] && [ -f "$MASQ_IFACE_FILE" ]; then
+            SAVED_IFACE="$(cat "$MASQ_IFACE_FILE" 2>/dev/null)"
+        fi
+
+        if command -v iptables >/dev/null 2>&1 && [ -n "$SAVED_IFACE" ]; then
+            remove_forward_rules "$SAVED_IFACE"
             remove_masq_rule "$SAVED_IFACE"
         fi
 
-        CURRENT_IFACE="$(get_default_iface 2>/dev/null || true)"
-        if [ -n "$CURRENT_IFACE" ] && [ "$CURRENT_IFACE" != "$SAVED_IFACE" ]; then
-            remove_masq_rule "$CURRENT_IFACE"
-        fi
-
-        rm -f /etc/stun/masq_iface
+        rm -f "$PIDS_FILE" "$OPENVPN_PID_FILE" "$STUNNEL_PID_FILE" "$MASQ_IFACE_FILE"
+        restore_ip_forwarding
+        echo "Stopped services and cleaned firewall rules."
         ;;
     addclient) 
         cd /etc/stun || exit
@@ -285,21 +511,12 @@ EOF
         }
         cd /etc/stun || exit
 
-        DEFAULT_PORT="$(awk -F '=' '/^[[:space:]]*accept[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); if ($2 ~ /^[0-9]+$/) {print $2; exit}}' /etc/stun/stunconfig.conf 2>/dev/null)"
-        DEFAULT_PORT="${DEFAULT_PORT:-1194}"
-
-        echo "Enter Server Public IP"
-        read -r SERVER_IP
-        echo "Enter remote port (default: $DEFAULT_PORT)"
-        read -r REMOTE_PORT
-        REMOTE_PORT="${REMOTE_PORT:-$DEFAULT_PORT}"
-
         cat <<EOF > "clients/${NAME}.ovpn"
 client
 proto tcp
 dev tun
 
-remote $SERVER_IP $REMOTE_PORT
+remote 127.0.0.1 1194
 cipher AES-256-GCM
 persist-key
 persist-tun
