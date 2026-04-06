@@ -29,6 +29,39 @@ get_stunnel_bin () {
     return 1
 }
 
+get_default_iface () {
+    local iface
+
+    if command -v ip >/dev/null 2>&1; then
+        iface="$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+    fi
+
+    if [ -z "$iface" ] && command -v route >/dev/null 2>&1; then
+        iface="$(route -n 2>/dev/null | awk '$1 == "0.0.0.0" {print $8; exit}')"
+    fi
+
+    if [ -z "$iface" ]; then
+        return 1
+    fi
+
+    echo "$iface"
+}
+
+add_masq_rule () {
+    local iface="$1"
+
+    iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
+        iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+}
+
+remove_masq_rule () {
+    local iface="$1"
+
+    while iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -o "$iface" -j MASQUERADE || break
+    done
+}
+
 install_deps () {
     get_pm || return 1
 
@@ -87,6 +120,7 @@ case "$1" in
         ./easyrsa gen-req server nopass
         ./easyrsa sign-req server server
         ./easyrsa gen-dh
+        ./easyrsa gen-crl
 
         openvpn --genkey secret /etc/stun/ta.key
 
@@ -94,6 +128,8 @@ case "$1" in
         cp pki/issued/server.crt /etc/stun
         cp pki/private/server.key /etc/stun
         cp pki/dh.pem /etc/stun
+        cp pki/crl.pem /etc/stun
+        chmod 644 /etc/stun/crl.pem
 
         cd /etc/stun || exit
 
@@ -109,6 +145,7 @@ key /etc/stun/server.key
 dh /etc/stun/dh.pem
 
 tls-crypt /etc/stun/ta.key
+crl-verify /etc/stun/crl.pem
 topology subnet
 server 10.8.0.0 255.255.255.0
 
@@ -186,6 +223,15 @@ EOF
             echo "stunnel binary not found"
             exit 1
         }
+        DEFAULT_IFACE="$(get_default_iface)" || {
+            echo "Could not detect default network interface for MASQUERADE"
+            exit 1
+        }
+        add_masq_rule "$DEFAULT_IFACE" || {
+            echo "Failed to add MASQUERADE rule on interface: $DEFAULT_IFACE"
+            exit 1
+        }
+        echo "$DEFAULT_IFACE" > /etc/stun/masq_iface
         openvpn --daemon --config /etc/stun/server.conf
         "$STUNNEL_BIN" /etc/stun/stunconfig.conf
         ;;
@@ -193,6 +239,22 @@ EOF
         pkill -x openvpn 2>/dev/null
         pkill -x stunnel 2>/dev/null
         pkill -x stunnel4 2>/dev/null
+
+        SAVED_IFACE=""
+        if [ -f /etc/stun/masq_iface ]; then
+            SAVED_IFACE="$(cat /etc/stun/masq_iface 2>/dev/null)"
+        fi
+
+        if [ -n "$SAVED_IFACE" ]; then
+            remove_masq_rule "$SAVED_IFACE"
+        fi
+
+        CURRENT_IFACE="$(get_default_iface 2>/dev/null || true)"
+        if [ -n "$CURRENT_IFACE" ] && [ "$CURRENT_IFACE" != "$SAVED_IFACE" ]; then
+            remove_masq_rule "$CURRENT_IFACE"
+        fi
+
+        rm -f /etc/stun/masq_iface
         ;;
     addclient) 
         cd /etc/stun || exit
@@ -272,9 +334,83 @@ EOF
     delclient)
         cd /etc/stun || exit
 
+        echo "Enter client name to delete:"
+        read -r NAME
+
+        if [ -z "$NAME" ]; then
+            echo "Client name cannot be empty"
+            exit 1
+        fi
+
+        if [ ! -d /etc/stun/easy-rsa ]; then
+            echo "EasyRSA directory not found: /etc/stun/easy-rsa"
+            exit 1
+        fi
+
+        cd /etc/stun/easy-rsa || exit
+        export EASYRSA_BATCH=1
+
+        CERT_STATE="$(awk -v cn="/CN=${NAME}" '$0 ~ cn"$" {state=substr($1,1,1)} END {if (state == "") print "N"; else print state}' pki/index.txt 2>/dev/null)"
+
+        case "$CERT_STATE" in
+            V)
+                ./easyrsa revoke "$NAME" || {
+                    echo "Failed to revoke certificate for ${NAME}"
+                    exit 1
+                }
+                ./easyrsa gen-crl || {
+                    echo "Failed to regenerate CRL"
+                    exit 1
+                }
+                cp pki/crl.pem /etc/stun/crl.pem
+                chmod 644 /etc/stun/crl.pem
+                echo "Revoked certificate for ${NAME} and updated CRL"
+                ;;
+            R)
+                if [ -f pki/crl.pem ]; then
+                    cp pki/crl.pem /etc/stun/crl.pem
+                    chmod 644 /etc/stun/crl.pem
+                fi
+                echo "Certificate for ${NAME} is already revoked"
+                ;;
+            *)
+                echo "No certificate record found for ${NAME}; skipping revocation"
+                ;;
+        esac
+
+        cd /etc/stun || exit
+
+        rm -f "/etc/stun/clients/${NAME}.ovpn"
+        rm -f "/etc/stun/easy-rsa/pki/issued/${NAME}.crt"
+        rm -f "/etc/stun/easy-rsa/pki/private/${NAME}.key"
+        rm -f "/etc/stun/easy-rsa/pki/reqs/${NAME}.req"
+
+        if [ -f /etc/stun/server.conf ] && ! grep -Eq '^[[:space:]]*crl-verify[[:space:]]+/etc/stun/crl\.pem([[:space:]]|$)' /etc/stun/server.conf; then
+            echo "crl-verify /etc/stun/crl.pem" >> /etc/stun/server.conf
+            echo "Added crl-verify to server.conf"
+        fi
+
+        echo "Client ${NAME} deleted from files. Restart OpenVPN to ensure CRL changes are active."
+
         ;;
     help|"")
-        echo "Usage: "
+        SCRIPT_NAME="$(basename "$0")"
+        cat <<EOF
+Usage:
+  ./$SCRIPT_NAME install
+  ./$SCRIPT_NAME start
+  ./$SCRIPT_NAME addclient
+  ./$SCRIPT_NAME delclient
+  ./$SCRIPT_NAME stop
+
+Directions:
+1. Run 'install' once on the server to set up OpenVPN, stunnel, and PKI files.
+2. Run 'start' to launch OpenVPN and stunnel.
+3. Run 'addclient' for each user; their profile is saved in /etc/stun/clients/<name>.ovpn.
+4. Import that .ovpn file alongside the stunnel .conf file generated into the user's Stunskin client.
+5. Run 'delclient' to revoke and remove a user.
+6. After 'delclient', restart services (stop then start) so CRL changes are active.
+EOF
         ;;
     *)
         echo "Unknown command: $1 Aborting..."
