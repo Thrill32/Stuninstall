@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+if [ "$EUID" -ne 0 ]; then
+    echo "Run as root"
+    exit 1
+fi
+
 #install stunnel4, openvpn, and easyrsa
 PIDS_FILE="/etc/stun/pids.txt"
 OPENVPN_PID_FILE="/etc/stun/openvpn.pid"
@@ -350,7 +355,12 @@ EOF
 
 
         #cat server.crt server.key ca.crt > stunnel.pem
-        openssl req -new -x509 -days 36500 -nodes -out stunnel.pem -keyout stunnel.pem
+        #openssl req -new -x509 -days 36500 -nodes -out stunnel.pem -keyout stunnel.pem
+
+        openssl req -new -x509 -days 36500 -nodes \
+    -subj "/CN=stun" \
+    -out stunnel.pem \
+    -keyout stunnel.pem
 
         chmod 600 stunnel.pem
 
