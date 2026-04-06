@@ -98,6 +98,22 @@ get_stunnel_user_group () {
     echo "${user_name}:${group_name}"
 }
 
+generate_ta_key () {
+    local key_path="$1"
+
+    # OpenVPN CLI changed across versions; try both supported forms.
+    if openvpn --genkey secret "$key_path" >/dev/null 2>&1; then
+        :
+    elif openvpn --genkey --secret "$key_path" >/dev/null 2>&1; then
+        :
+    else
+        echo "Failed to generate tls-crypt key at $key_path"
+        return 1
+    fi
+
+    chmod 600 "$key_path" 2>/dev/null || true
+}
+
 ensure_ip_forwarding () {
     local current
 
@@ -294,7 +310,7 @@ case "$1" in
         ./easyrsa gen-dh
         ./easyrsa gen-crl
 
-        openvpn --genkey secret /etc/stun/ta.key
+        generate_ta_key /etc/stun/ta.key || exit 1
 
         cp pki/ca.crt /etc/stun
         cp pki/issued/server.crt /etc/stun
@@ -531,7 +547,6 @@ cipher AES-256-GCM
 persist-key
 persist-tun
 
-key-direction 1
 auth SHA256
 
 remote-cert-tls server
