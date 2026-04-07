@@ -483,10 +483,13 @@ EOF
 
         cat <<EOF > stunclientconfig.conf
 client = yes
+foreground = no
 
 [openvpn]
 accept = 127.0.0.1:1194
 connect = $SERVER_IP:$PORT
+verifyChain = no
+cert = /path/to/Stunnel.pem
 EOF
 
         mkdir /etc/stun/clients
@@ -612,6 +615,8 @@ EOF
             NAME="${BASE_NAME}${NUM}"
             NUM=$((NUM + 1))
         done
+        
+        mkdir -p "/etc/stun/clients/$NAME"
 
         cd /etc/stun/easy-rsa || exit
         export EASYRSA_BATCH=1
@@ -621,7 +626,7 @@ EOF
         }
         cd /etc/stun || exit
 
-        cat <<EOF > "clients/${NAME}.ovpn"
+        cat <<EOF > "clients/$NAME/${NAME}.ovpn"
 client
 proto tcp
 dev tun
@@ -654,7 +659,11 @@ $(cat /etc/stun/ta.key)
 </tls-crypt>
 EOF
 
-        echo "Client profile created: /etc/stun/clients/${NAME}.ovpn"
+        echo "Client profile created: /etc/stun/clients/$NAME/${NAME}.ovpn"
+        cp /etc/stun/stunclientconfig.conf "/etc/stun/clients/$NAME/stunnel-$NAME.conf" #convenience
+        cp /etc/stun/stunnel.pem "/etc/stun/clients/$NAME/"
+        zip -r "/etc/stun/clients/$NAME/stunskin-$NAME.zip" "/etc/stun/clients/$NAME/"
+
         
         ;;
     delclient)
