@@ -719,6 +719,11 @@ EOF
         echo "Client ${NAME} deleted from files. Restart OpenVPN to ensure CRL changes are active."
 
         ;;
+    restart)
+        "$0" "stop" || exit 1
+        sleep 7
+        exec "$0" "start"
+        ;;
     help|"")
         SCRIPT_NAME="$(basename "$0")"
         cat <<EOF
@@ -728,6 +733,7 @@ Usage:
   ./$SCRIPT_NAME addclient
   ./$SCRIPT_NAME delclient
   ./$SCRIPT_NAME stop
+  ./$SCRIPT_NAME restart
 
 Directions:
 1. Run 'install' once on the server to set up OpenVPN, stunnel, and PKI files.
@@ -735,7 +741,7 @@ Directions:
 3. Run 'addclient' for each user; their profile is saved in /etc/stun/clients/<name>.ovpn.
 4. Import that .ovpn file alongside the stunnel .conf file generated into the user's Stunskin client.
 5. Run 'delclient' to revoke and remove a user.
-6. After 'delclient', restart services (stop then start) so CRL changes are active.
+6. After 'delclient', restart services so CRL changes are active.
 EOF
         ;;
     *)
