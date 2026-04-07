@@ -488,8 +488,8 @@ foreground = no
 [openvpn]
 accept = 127.0.0.1:1194
 connect = $SERVER_IP:$PORT
-verifyChain = no
-cert = /path/to/Stunnel.pem
+verifyChain = yes
+CAfile = stunnel-server.crt
 EOF
 
         mkdir /etc/stun/clients
@@ -610,7 +610,7 @@ EOF
         BASE_NAME="$NAME"
         NUM=2
 
-        while [ -f "/etc/stun/clients/${NAME}.ovpn" ] || [ -f "/etc/stun/easy-rsa/pki/issued/${NAME}.crt" ] || [ -f "/etc/stun/easy-rsa/pki/private/${NAME}.key" ]; do
+        while [ -d "/etc/stun/clients/${NAME}" ] || [ -f "/etc/stun/easy-rsa/pki/issued/${NAME}.crt" ] || [ -f "/etc/stun/easy-rsa/pki/private/${NAME}.key" ]; do
             echo "Client name taken.. appending $NUM"
             NAME="${BASE_NAME}${NUM}"
             NUM=$((NUM + 1))
@@ -660,9 +660,37 @@ $(cat /etc/stun/ta.key)
 EOF
 
         echo "Client profile created: /etc/stun/clients/$NAME/${NAME}.ovpn"
-        cp /etc/stun/stunclientconfig.conf "/etc/stun/clients/$NAME/stunnel-$NAME.conf" #convenience
-        cp /etc/stun/stunnel.pem "/etc/stun/clients/$NAME/"
-        zip -r "/etc/stun/clients/$NAME/stunskin-$NAME.zip" "/etc/stun/clients/$NAME/"
+        CLIENT_DIR="/etc/stun/clients/$NAME"
+
+        if [ ! -f /etc/stun/stunclientconfig.conf ]; then
+            echo "Missing stunnel client template: /etc/stun/stunclientconfig.conf"
+            exit 1
+        fi
+        if [ ! -f /etc/stun/stunnel.pem ]; then
+            echo "Missing stunnel certificate file: /etc/stun/stunnel.pem"
+            exit 1
+        fi
+
+        cp /etc/stun/stunclientconfig.conf "$CLIENT_DIR/stunnel-$NAME.conf" || {
+            echo "Failed to copy stunnel client config"
+            exit 1
+        }
+
+        awk '/-----BEGIN CERTIFICATE-----/{print_flag=1} print_flag {print} /-----END CERTIFICATE-----/{print_flag=0}' /etc/stun/stunnel.pem > "$CLIENT_DIR/stunnel-server.crt"
+        if [ ! -s "$CLIENT_DIR/stunnel-server.crt" ]; then
+            echo "Failed to extract stunnel public certificate"
+            exit 1
+        fi
+        chmod 644 "$CLIENT_DIR/stunnel-server.crt"
+
+        (
+            cd "$CLIENT_DIR" || exit 1
+            zip -r "stunskin-$NAME.zip" "${NAME}.ovpn" "stunnel-$NAME.conf" "stunnel-server.crt" >/dev/null
+        ) || {
+            echo "Failed to create client zip package"
+            exit 1
+        }
+        echo "Client bundle created: $CLIENT_DIR/stunskin-$NAME.zip"
 
         
         ;;
@@ -715,7 +743,11 @@ EOF
 
         cd /etc/stun || exit
 
-        rm -f "/etc/stun/clients/${NAME}.ovpn"
+        rm -f "/etc/stun/clients/${NAME}/${NAME}.ovpn"
+        rm -f "/etc/stun/clients/${NAME}/stunnel-${NAME}.conf"
+        rm -f "/etc/stun/clients/${NAME}/stunnel-server.crt"
+        rm -f "/etc/stun/clients/${NAME}/stunskin-${NAME}.zip"
+        rmdir "/etc/stun/clients/${NAME}" 2>/dev/null || true
         rm -f "/etc/stun/easy-rsa/pki/issued/${NAME}.crt"
         rm -f "/etc/stun/easy-rsa/pki/private/${NAME}.key"
         rm -f "/etc/stun/easy-rsa/pki/reqs/${NAME}.req"
@@ -747,7 +779,7 @@ Usage:
 Directions:
 1. Run 'install' once on the server to set up OpenVPN, stunnel, and PKI files.
 2. Run 'start' to launch OpenVPN and stunnel.
-3. Run 'addclient' for each user; their profile is saved in /etc/stun/clients/<name>.ovpn.
+3. Run 'addclient' for each user; artifacts are saved in /etc/stun/clients/<name>/.
 4. Import that .ovpn file alongside the stunnel .conf file generated into the user's Stunskin client.
 5. Run 'delclient' to revoke and remove a user.
 6. After 'delclient', restart services so CRL changes are active.
