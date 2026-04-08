@@ -489,7 +489,7 @@ foreground = no
 accept = 127.0.0.1:1194
 connect = $SERVER_IP:$PORT
 verifyChain = yes
-CAfile = stunnel-server.crt
+CAfile = stunnel-server.pem
 EOF
 
         mkdir /etc/stun/clients
@@ -676,16 +676,16 @@ EOF
             exit 1
         }
 
-        awk '/-----BEGIN CERTIFICATE-----/{print_flag=1} print_flag {print} /-----END CERTIFICATE-----/{print_flag=0}' /etc/stun/stunnel.pem > "$CLIENT_DIR/stunnel-server.crt"
-        if [ ! -s "$CLIENT_DIR/stunnel-server.crt" ]; then
+        awk '/-----BEGIN CERTIFICATE-----/{print_flag=1} print_flag {print} /-----END CERTIFICATE-----/{print_flag=0}' /etc/stun/stunnel.pem > "$CLIENT_DIR/stunnel-server.pem"
+        if [ ! -s "$CLIENT_DIR/stunnel-server.pem" ]; then
             echo "Failed to extract stunnel public certificate"
             exit 1
         fi
-        chmod 644 "$CLIENT_DIR/stunnel-server.crt"
+        chmod 644 "$CLIENT_DIR/stunnel-server.pem"
 
         (
             cd "$CLIENT_DIR" || exit 1
-            zip -r "stunskin-$NAME.zip" "${NAME}.ovpn" "stunnel-$NAME.conf" "stunnel-server.crt" >/dev/null
+            zip -r "stunskin-$NAME.zip" "${NAME}.ovpn" "stunnel-$NAME.conf" "stunnel-server.pem" >/dev/null
         ) || {
             echo "Failed to create client zip package"
             exit 1
@@ -745,7 +745,7 @@ EOF
 
         rm -f "/etc/stun/clients/${NAME}/${NAME}.ovpn"
         rm -f "/etc/stun/clients/${NAME}/stunnel-${NAME}.conf"
-        rm -f "/etc/stun/clients/${NAME}/stunnel-server.crt"
+        rm -f "/etc/stun/clients/${NAME}/stunnel-server.pem"
         rm -f "/etc/stun/clients/${NAME}/stunskin-${NAME}.zip"
         rmdir "/etc/stun/clients/${NAME}" 2>/dev/null || true
         rm -f "/etc/stun/easy-rsa/pki/issued/${NAME}.crt"
